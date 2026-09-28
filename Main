@@ -1,0 +1,347 @@
+#include <LiquidCrystal_I2C.h>
+
+/*
+  Entradas organizadas em listas, facilitando uso de multiplas entradas/sensores
+*/
+
+// Botão Entrada
+int           cont_botao         = 0;
+const int     botaoPin           = 4;
+unsigned long ultimoCliqueValido = 0; // Numero alto por conta dos milis
+const int     cooldownBotao      = 3000;       // 3s
+
+// Botão Saída
+const int botaoSaida                  = 33;
+unsigned long ultimoCliqueValidoSaida = 0;
+
+// Sensor Ultrassonico
+const int trigPins[] = {5};
+const int echoPins[] = {18};
+
+// Leds
+const int ledPins[]  = {15};
+
+// L2C / LCD
+LiquidCrystal_I2C lcd(0x27, 21, 22);
+
+/*
+  Variaveis do sistema
+*/
+
+// Número total de sensores
+const int NUM_SENSORES = sizeof(trigPins) / sizeof(trigPins[0]);
+
+// Controle do sistema
+bool sistemaLiberado   = false;
+
+// Sensor
+unsigned long tempoInicial[NUM_SENSORES] = {0};
+
+// Contagens referente ao sensor
+bool contando[NUM_SENSORES] = {false};
+bool inicio[NUM_SENSORES]   = {false};
+
+/*
+  Inicializa as entradas e saidas
+*/
+
+// ================= SETUP =================
+void setup() {
+
+    Serial.begin(115200);
+
+    // Botões
+    pinMode(botaoPin, INPUT_PULLUP);   // Inicia o botão de entrada
+    pinMode(botaoSaida, INPUT_PULLUP); // Inicia o botão de saída
+
+    /*
+      Percorre um loop for baseado na quantia de sensores
+      baseado na lista declarada anteriormente, conecta os
+      Sensores / leds
+    */
+    for (int i = 0; i < NUM_SENSORES; i++)
+    {
+
+        pinMode(trigPins[i], OUTPUT); // Conecta os triggers dos sensores
+        pinMode(echoPins[i], INPUT);  // Conecta os echo dos sensores
+
+        pinMode(ledPins[i],  OUTPUT); // Conecta os leds relacionados aos sensores
+    }
+
+    Wire.begin(21, 22); // SDA na GPIO 21, SCL na GPIO 22
+    lcd.init();         // Inicializa o LCD
+    lcd.backlight();    // Liga a luz de fundo
+    lcd.setCursor(0, 0);
+
+    AtualizarTela(NUM_SENSORES);
+}
+
+/*
+  Loop principal do sistema, onde a base principal é feita
+  Verifica os botões inicialmente, esperando a entrada no botão de entrada
+  Caso botão de entrada seja pressionado, continua para o sistema
+  Verifica sensores constantemente chamando a função
+*/
+// ================= LOOP =================
+void loop() {
+
+    // Verificação dos botões
+    verificarBotao();      // Verifica se o botão de entrada foi pressionado
+    verificarBotaoSaida(); // Verifica se o botão de saída foi pressionado
+
+    // Sistema desligado
+    /*
+      Mantém o sistema preso nessa parte enquanto o botão de entrada não for pressionado
+    */
+    if (!sistemaLiberado)
+    {
+        Serial.println("Sistema aguardando botão...");
+        delay(100);
+
+        return;
+    }
+
+    // Leitura dos sensores
+    /*
+      Percorre um loop for baseado na quantia de sensores
+      baseado na lista declarada anteriormente, checa os sensores
+      com pequeno delay para evitar eco (Não ocorre no wokwi, mas ocorreria na vida real)
+      Chama função de verificação de distância
+    */
+    for (int i = 0; i < NUM_SENSORES; i++)
+    {
+
+        // Elimina qualquer pulso anterior
+        digitalWrite(trigPins[i], LOW);
+        delayMicroseconds(2);
+
+        // Inicia pulso atual
+        digitalWrite(trigPins[i], HIGH);
+        delayMicroseconds(10);
+
+        // Finaliza o pulso atual após 10 micro segundos
+        digitalWrite(trigPins[i], LOW);
+
+        /*
+          Chama a função de verificação de distância
+          Envia:
+          i = Número do sensor
+       */
+        verificarDistancia(i);
+
+        delay(50);
+    }
+}
+
+void AtualizarTela(int cont_botao) {
+    // Limpa o LCD
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    // Atualiza o LCD baseado na quantia de vagas
+    lcd.print("Vagas:");
+    lcd.print(NUM_SENSORES - cont_botao);
+    lcd.print("/");
+    lcd.print(NUM_SENSORES);
+}
+
+// ================= BOTÃO ENTRADA =================
+void verificarBotao() {
+
+    // Limite máximo do número de sensores
+    if (cont_botao >= NUM_SENSORES + 1)
+    {
+        // Bloqueia o sistema
+        sistemaLiberado = false;
+        return;
+    }
+
+    // Caso a quantia for menor que o máximo de sensores e o botão seja pressionado
+    if (digitalRead(botaoPin) == LOW)
+    {
+        // Primeiro clique OU cooldown (Debounce) concluído
+        if (millis() - ultimoCliqueValido >= cooldownBotao || cont_botao == 0)
+        {
+
+            // Salva o ultimo clique em milissegundos para cooldown (Debounce)
+            ultimoCliqueValido = millis();
+
+            sistemaLiberado = true;
+
+            // Incrementa entrada
+            cont_botao++;
+
+            Serial.print("Sistema iniciado. Total: ");
+            Serial.println(cont_botao);
+
+            delay(300);
+        }
+    }
+}
+
+// ================= BOTÃO SAÍDA =================
+void verificarBotaoSaida() {
+
+    // Caso botão seja pressionado
+    if (digitalRead(botaoSaida) == LOW)
+    {
+
+        // Verifica cooldown (Debounce)
+        if (millis() - ultimoCliqueValidoSaida >= cooldownBotao)
+        {
+
+            // Garante que existe ao menos um veiculo estacionado
+            if (cont_botao > 0)
+            {
+                cont_botao--;
+            }
+
+            // Se zerar, desliga sistema
+            if (cont_botao <= 0)
+            {
+
+                cont_botao = 0;
+                sistemaLiberado = false;
+            }
+
+            // Salva ultimo clique em milissegundos para cooldown (Debounce)
+            ultimoCliqueValidoSaida = millis();
+
+            Serial.print("Veiculo saiu. Total: ");
+            Serial.println(cont_botao);
+
+            AtualizarTela(cont_botao);
+
+            delay(300);
+        }
+    }
+}
+
+void PiscarLed(
+    int Tempo,
+    int Led) {
+}
+
+/*
+  função de verificação de distância
+  Recebe:
+  Número do sensor
+  Pin do echo do sensor
+  Pin do led do sensor
+
+  Verifica os sensores
+  Caso sensor não funcione (0 como entrada):
+    Mantém led aceso
+
+  Lida com leds baseado na distância captada no sensor
+*/
+// ================= DISTÂNCIA =================
+void verificarDistancia(
+    int sensor
+    )
+{
+    int echoPin  = echoPins[sensor];
+    // Verifica duração de tempo do som até algo
+    int duration = pulseIn(echoPin, HIGH, 30000);
+
+    // Matemática transformando duração em distância
+    int distance = duration / 58;
+
+    Serial.print("Sensor ");
+    Serial.print(sensor + 1);
+    Serial.print(" - Distancia: ");
+    Serial.println(distance);
+
+    // ================= SEM LEITURA =================
+    // Caso sensor falhe, mantém led ligado
+    if (distance == 0) {
+        FalhaSensor(sensor);
+    }
+
+    // ================= ACIMA DE 100 =================
+    // Caso a distância seja maior que 100, mantém tudo desligado
+    else if (distance > 100) {
+        ForaDistancia(sensor);
+    }
+
+    // ================= ENTRE 80 E 100 =================
+    /*
+      Distância entre 80-100
+      Inicializa o sistema, permitindo que distâncias mais próximas possam rodar
+   */
+    else if (distance > 80) {
+        DistanciaInicial(sensor);
+    }
+
+    else if (inicio[sensor]) {
+
+        // ================= ENTRE 50 E 80 =================
+        if (distance > 50) {
+            EstacionandoInicial(sensor);
+        }
+
+        // ================= ENTRE 15 E 50 =================
+        else if (distance > 15) {
+            EstacionandoMeio(sensor);
+        }
+
+        // ============== MENOR OU IGUAL A 15 =================
+        else if (distance <= 15) {
+            EstacionandoFinal(sensor);
+        }
+    }
+
+    delay(100);
+}
+
+void FalhaSensor(
+    int sensor
+) {
+    int ledPin        = ledPins[sensor];
+    digitalWrite(ledPin, HIGH);
+}
+
+void ForaDistancia(
+    int sensor
+) {
+    int ledPin       = ledPins[sensor];
+    digitalWrite(ledPin, LOW);
+
+    contando[sensor] = false;
+    inicio[sensor]   = false;
+}
+
+void DistanciaInicial(
+    int sensor
+) {
+    int ledPin       = ledPins[sensor];
+    inicio[sensor]   = true;
+
+    digitalWrite(ledPin, LOW);
+}
+
+void EstacionandoInicial(
+    int sensor
+) {
+    int ledPin       = ledPins[sensor];
+    digitalWrite(ledPin, LOW);
+}
+
+void EstacionandoMeio(
+    int sensor
+) {
+    int ledPin       = ledPins[sensor];
+    digitalWrite(ledPin, HIGH);
+}
+
+void EstacionandoFinal(
+    int sensor
+) {
+    int ledPin       = ledPins[sensor];
+    digitalWrite(ledPin, HIGH);
+
+    contando[sensor] = false;
+    inicio[sensor]   = false;
+
+    sistemaLiberado  = false;
+    AtualizarTela(cont_botao);
+}
