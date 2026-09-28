@@ -7,19 +7,27 @@
 // Botão Entrada
 int           cont_botao         = 0;
 const int     botaoPin           = 4;
-unsigned long ultimoCliqueValido = 0; // Numero alto por conta dos milis
-const int     cooldownBotao      = 3000;       // 3s
+unsigned long ultimoCliqueValido = 0;    // Numero alto por conta dos milis
+const int     cooldownBotao      = 3000; // 3s
 
 // Botão Saída
 const int botaoSaida                  = 33;
 unsigned long ultimoCliqueValidoSaida = 0;
 
+// Estacionamento
 // Sensor Ultrassonico
 const int trigPins[] = {5};
 const int echoPins[] = {18};
 
 // Leds
 const int ledPins[]  = {15};
+
+// Adas (Veiculos Passando na Frente)
+const int trigPinsAdas[] = {14};
+const int echoPinsAdas[] = {26};
+const int ledPinsAdas[]  = {16};
+
+const int DISTANCIAADAS  = 100;
 
 // L2C / LCD
 LiquidCrystal_I2C lcd(0x27, 21, 22);
@@ -64,8 +72,11 @@ void setup() {
 
         pinMode(trigPins[i], OUTPUT); // Conecta os triggers dos sensores
         pinMode(echoPins[i], INPUT);  // Conecta os echo dos sensores
-
         pinMode(ledPins[i],  OUTPUT); // Conecta os leds relacionados aos sensores
+
+        pinMode(trigPinsAdas[i], OUTPUT); // Conecta os triggers dos sensores
+        pinMode(echoPinsAdas[i], INPUT);  // Conecta os echo dos sensores
+        pinMode(ledPinsAdas[i],  OUTPUT); // Conecta os leds relacionados aos sensores
     }
 
     Wire.begin(21, 22); // SDA na GPIO 21, SCL na GPIO 22
@@ -73,7 +84,7 @@ void setup() {
     lcd.backlight();    // Liga a luz de fundo
     lcd.setCursor(0, 0);
 
-    AtualizarTela(NUM_SENSORES);
+    AtualizarTela();
 }
 
 /*
@@ -88,6 +99,7 @@ void loop() {
     // Verificação dos botões
     verificarBotao();      // Verifica se o botão de entrada foi pressionado
     verificarBotaoSaida(); // Verifica se o botão de saída foi pressionado
+    VerificarTodosAdas();
 
     // Sistema desligado
     /*
@@ -108,8 +120,11 @@ void loop() {
       com pequeno delay para evitar eco (Não ocorre no wokwi, mas ocorreria na vida real)
       Chama função de verificação de distância
     */
-    for (int i = 0; i < NUM_SENSORES; i++)
-    {
+    VerificarTodosEstacionamentos();
+}
+
+void VerificarTodosEstacionamentos() {
+    for (int i = 0; i < NUM_SENSORES; i++) {
 
         // Elimina qualquer pulso anterior
         digitalWrite(trigPins[i], LOW);
@@ -128,12 +143,36 @@ void loop() {
           i = Número do sensor
        */
         verificarDistancia(i);
-
         delay(50);
     }
 }
 
-void AtualizarTela(int cont_botao) {
+
+void VerificarTodosAdas() {
+    for (int i = 0; i < NUM_SENSORES; i++) {
+
+        // Elimina qualquer pulso anterior
+        digitalWrite(trigPinsAdas[i], LOW);
+        delayMicroseconds(2);
+
+        // Inicia pulso atual
+        digitalWrite(trigPinsAdas[i], HIGH);
+        delayMicroseconds(10);
+
+        // Finaliza o pulso atual após 10 micro segundos
+        digitalWrite(trigPinsAdas[i], LOW);
+
+        /*
+          Chama a função de verificação de distância
+          Envia:
+          i = Número do sensor
+       */
+        SensorAdas(i);
+        delay(50);
+    }
+}
+
+void AtualizarTela() {
     // Limpa o LCD
     lcd.clear();
     lcd.setCursor(0, 0);
@@ -209,7 +248,7 @@ void verificarBotaoSaida() {
             Serial.print("Veiculo saiu. Total: ");
             Serial.println(cont_botao);
 
-            AtualizarTela(cont_botao);
+            AtualizarTela();
 
             delay(300);
         }
@@ -219,6 +258,31 @@ void verificarBotaoSaida() {
 void PiscarLed(
     int Tempo,
     int Led) {
+}
+
+// Funções que retornam tem que ser definidas com o tipo do return (paia)
+int DistanciaSensor(
+    int sensor
+) {
+    int echoPin  = echoPins[sensor];
+    // Verifica duração de tempo do som até algo
+    int duration = pulseIn(echoPin, HIGH, 30000);
+
+    // Matemática transformando duração em distância
+    int distance = duration / 58;
+    return distance;
+}
+
+int DistanciaSensorAdas(
+    int sensor
+) {
+    int echoPin  = echoPinsAdas[sensor];
+    // Verifica duração de tempo do som até algo
+    int duration = pulseIn(echoPin, HIGH, 30000);
+
+    // Matemática transformando duração em distância
+    int distance = duration / 58;
+    return distance;
 }
 
 /*
@@ -239,12 +303,8 @@ void verificarDistancia(
     int sensor
     )
 {
-    int echoPin  = echoPins[sensor];
-    // Verifica duração de tempo do som até algo
-    int duration = pulseIn(echoPin, HIGH, 30000);
 
-    // Matemática transformando duração em distância
-    int distance = duration / 58;
+    int distance = DistanciaSensor(sensor);
 
     Serial.print("Sensor ");
     Serial.print(sensor + 1);
@@ -343,5 +403,22 @@ void EstacionandoFinal(
     inicio[sensor]   = false;
 
     sistemaLiberado  = false;
-    AtualizarTela(cont_botao);
+    AtualizarTela();
+}
+
+// Parte Adas 2 
+
+void SensorAdas(
+    int sensor
+) {
+    int echoPin = echoPinsAdas[sensor];
+    int ledPin  = ledPinsAdas[sensor];
+
+    int distance = DistanciaSensorAdas(sensor);
+    if (distance < DISTANCIAADAS) {
+        digitalWrite(ledPin, HIGH);
+    } else {
+        digitalWrite(ledPin, LOW);
+    }
+
 }
