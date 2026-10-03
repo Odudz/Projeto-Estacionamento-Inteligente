@@ -1,4 +1,3 @@
-#include <LiquidCrystal_I2C.h>
 
 /*
   Entradas organizadas em listas, facilitando uso de multiplas entradas/sensores
@@ -16,21 +15,19 @@ unsigned long ultimoCliqueValidoSaida = 0;
 
 // Estacionamento
 // Sensor Ultrassonico
-const int trigPins[] = {5};
-const int echoPins[] = {18};
+const int trigPins[] = {5,  35, 19};
+const int echoPins[] = {18, 34, 21};
 
 // Leds
 const int ledPins[]  = {15};
 
 // Adas (Veiculos Passando na Frente)
-const int trigPinsAdas[] = {14};
-const int echoPinsAdas[] = {26};
+const int trigPinsAdas[] = {32};
+const int echoPinsAdas[] = {33};
 const int ledPinsAdas[]  = {16};
 
 const int DISTANCIAADAS  = 100;
 
-// L2C / LCD
-LiquidCrystal_I2C lcd(0x27, 21, 22);
 
 /*
   Variaveis do sistema
@@ -79,10 +76,6 @@ void setup() {
         pinMode(ledPinsAdas[i],  OUTPUT); // Conecta os leds relacionados aos sensores
     }
 
-    Wire.begin(21, 22); // SDA na GPIO 21, SCL na GPIO 22
-    lcd.init();         // Inicializa o LCD
-    lcd.backlight();    // Liga a luz de fundo
-    lcd.setCursor(0, 0);
 
     AtualizarTela();
 }
@@ -99,7 +92,8 @@ void loop() {
     // Verificação dos botões
     verificarBotao();      // Verifica se o botão de entrada foi pressionado
     verificarBotaoSaida(); // Verifica se o botão de saída foi pressionado
-    VerificarTodosAdas();
+    // VerificarTodosAdas(); - Sem uso na maquete
+    VerificarAdas(trigPinsAdas[0]);
 
     // Sistema desligado
     /*
@@ -147,40 +141,36 @@ void VerificarTodosEstacionamentos() {
     }
 }
 
+void VerificarAdas(int sensor) {
+    // Elimina qualquer pulso anterior
+    digitalWrite(trigPinsAdas[sensor], LOW);
+    delayMicroseconds(2);
 
+    // Inicia pulso atual
+    digitalWrite(trigPinsAdas[sensor], HIGH);
+    delayMicroseconds(10);
+
+    // Finaliza o pulso atual após 10 micro segundos
+    digitalWrite(trigPinsAdas[sensor], LOW);
+
+    /*
+        Chama a função de verificação de distância
+        Envia:
+        i = Número do sensor
+    */
+    SensorAdasMaquete(sensor);
+    delay(50);
+}
+
+// Sem uso para maquete
 void VerificarTodosAdas() {
     for (int i = 0; i < NUM_SENSORES; i++) {
-
-        // Elimina qualquer pulso anterior
-        digitalWrite(trigPinsAdas[i], LOW);
-        delayMicroseconds(2);
-
-        // Inicia pulso atual
-        digitalWrite(trigPinsAdas[i], HIGH);
-        delayMicroseconds(10);
-
-        // Finaliza o pulso atual após 10 micro segundos
-        digitalWrite(trigPinsAdas[i], LOW);
-
-        /*
-          Chama a função de verificação de distância
-          Envia:
-          i = Número do sensor
-       */
-        SensorAdas(i);
-        delay(50);
+        VerificarAdas(i);
     }
 }
 
 void AtualizarTela() {
-    // Limpa o LCD
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    // Atualiza o LCD baseado na quantia de vagas
-    lcd.print("Vagas:");
-    lcd.print(NUM_SENSORES - cont_botao);
-    lcd.print("/");
-    lcd.print(NUM_SENSORES);
+    
 }
 
 // ================= BOTÃO ENTRADA =================
@@ -420,5 +410,41 @@ void SensorAdas(
     } else {
         digitalWrite(ledPin, LOW);
     }
+
+}
+
+void AcenderLed(int index) {
+    int ledPin = ledPinsAdas[index];
+    digitalWrite(ledPin, HIGH);
+}
+
+void ApagarLed(int index) {
+    int ledPin = ledPinsAdas[index];
+    digitalWrite(ledPin, LOW);
+}
+
+void ApagarTodosLed() {
+    for (int i = 0; i < NUM_SENSORES; i++) {
+        ApagarLed(i);
+    }
+}
+
+void SensorAdasMaquete(
+    int sensor
+) {
+    int echoPin = echoPinsAdas[sensor];
+    int ledPin  = ledPinsAdas[sensor];
+
+    int distance = DistanciaSensorAdas(sensor);
+    ApagarTodosLed();
+    if (distance > NUM_SENSORES * 16) {
+        return;
+    }
+
+    int wantedsensor = floor(distance / 16);
+    if (wantedsensor != 0) {
+        wantedsensor -= 1;
+    }
+    AcenderLed(wantedsensor);
 
 }
