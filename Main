@@ -1,3 +1,12 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESP32Servo.h>
+
+
+const char* ssid = "TESTE_ESP";
+const char* password = "TESTE_ESP";
+
+WebServer server(80);
 
 /*
   Entradas organizadas em listas, facilitando uso de multiplas entradas/sensores
@@ -5,12 +14,12 @@
 
 // Botão Entrada
 int           cont_botao         = 0;
-const int     botaoPin           = 4;
+const int     botaoPin           = 22;
 unsigned long ultimoCliqueValido = 0;    // Numero alto por conta dos milis
 const int     cooldownBotao      = 3000; // 3s
 
 // Botão Saída
-const int botaoSaida                  = 33;
+const int botaoSaida                  = 23;
 unsigned long ultimoCliqueValidoSaida = 0;
 
 // Estacionamento
@@ -34,6 +43,23 @@ const int DISTANCIAADAS  = 100;
 // Número total de sensores
 const int NUM_SENSORES = sizeof(trigPins) / sizeof(trigPins[0]);
 
+const int PINO_SERVO = 27;
+const int ANGULO_FECHADO = 105;
+const int ANGULO_ABERTO = 15;
+const unsigned long TEMPO_ABERTO = 3000;
+Servo cancela;
+bool cancelaAberta = false;
+unsigned long aberturaCancela = 0;
+bool entradaPressionada = false;
+bool saidaPressionada = false;
+bool vagasOcupadas[NUM_SENSORES] = {};
+
+void abrirCancela() {
+    cancela.write(ANGULO_ABERTO);
+    aberturaCancela = millis();
+    cancelaAberta = true;
+}
+
 // Controle do sistema
 bool sistemaLiberado   = false;
 
@@ -49,9 +75,135 @@ bool inicio[NUM_SENSORES]   = {false};
 */
 
 // ================= SETUP =================
+void handleRoot() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Estacionamento Inteligente</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #f2f2f2; text-align: center; margin: 0; padding: 30px; }
+    h1 { color: #222; }
+    .container { max-width: 600px; margin: auto; }
+    .resumo { display: flex; justify-content: center; gap: 20px; margin: 30px 0; }
+    .card { background: white; padding: 25px; border-radius: 15px; box-shadow: 0 3px 10px rgba(0,0,0,0.15); flex: 1; }
+    .numero { font-size: 45px; font-weight: bold; }
+    .disponivel { color: #16a34a; }
+    .ocupado { color: #dc2626; }
+    .vagas { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; }
+    .vaga { background: white; padding: 20px; border-radius: 15px; box-shadow: 0 3px 10px rgba(0,0,0,0.15); }
+    .status { font-size: 18px; font-weight: bold; }
+  </style>
+</head>
+<body>
+
+<div class="container">
+  <h1>Estacionamento Inteligente</h1>
+
+  <div class="resumo">
+    <div class="card">
+      <div>Vagas disponíveis</div>
+      <div id="vagas-disponiveis" class="numero disponivel">--</div>
+    </div>
+    <div class="card">
+      <div>Vagas ocupadas</div>
+      <div id="vagas-ocupadas" class="numero ocupado">--</div>
+    </div>
+  </div>
+
+  <h2>Estado das vagas</h2>
+
+  <div class="vagas">
+    <div class="vaga">
+      <h3>Vaga 1</h3>
+      <div id="vaga1" class="status">Carregando...</div>
+    </div>
+    <div class="vaga">
+      <h3>Vaga 2</h3>
+      <div id="vaga2" class="status">Carregando...</div>
+    </div>
+    <div class="vaga">
+      <h3>Vaga 3</h3>
+      <div id="vaga3" class="status">Carregando...</div>
+    </div>
+  </div>
+
+  <p style="margin-top:30px;color:#777;">
+    Atualização em tempo real via AJAX
+  </p>
+</div>
+
+<script>
+  // Função que busca os dados atualizados do ESP32 via AJAX
+  function atualizarDados() {
+    fetch('/status')
+      .then(response => response.json())
+      .then(dados => {
+        // Atualiza os contadores principais
+        document.getElementById('vagas-disponiveis').innerText = dados.disp;
+        document.getElementById('vagas-ocupadas').innerText = dados.ocup;
+
+        // Atualiza a Vaga 1
+        let v1 = document.getElementById('vaga1');
+        v1.innerHTML = dados.v1 ? "🔴 Ocupada" : "🟢 Disponível";
+        v1.className = dados.v1 ? "status ocupado" : "status disponivel";
+
+        // Atualiza a Vaga 2
+        let v2 = document.getElementById('vaga2');
+        v2.innerHTML = dados.v2 ? "🔴 Ocupada" : "🟢 Disponível";
+        v2.className = dados.v2 ? "status ocupado" : "status disponivel";
+
+        // Atualiza a Vaga 3
+        let v3 = document.getElementById('vaga3');
+        v3.innerHTML = dados.v3 ? "🔴 Ocupada" : "🟢 Disponível";
+        v3.className = dados.v3 ? "status ocupado" : "status disponivel";
+      })
+      .catch(err => console.error("Erro ao buscar dados do ESP32:", err));
+  }
+
+  // Executa a função imediatamente ao abrir o site
+  atualizarDados();
+  // Configura para rodar repetidamente a cada 1 segundo (1000ms)
+  setInterval(atualizarDados, 1000);
+</script>
+
+</body>
+</html>
+)rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+void handleStatus() {
+  int vagasOcupadasCount = 0;
+  for (int i = 0; i < NUM_SENSORES; i++) {
+    if (vagasOcupadas[i]) vagasOcupadasCount++;
+  }
+  int vagasDisponiveis = NUM_SENSORES - vagasOcupadasCount;
+
+  String json = "{";
+  json += "\"disp\":" + String(vagasDisponiveis) + ",";
+  json += "\"ocup\":" + String(vagasOcupadasCount) + ",";
+  json += "\"v1\":" + String(vagasOcupadas[0] ? "true" : "false") + ",";
+  json += "\"v2\":" + String(vagasOcupadas[1] ? "true" : "false") + ",";
+  json += "\"v3\":" + String(vagasOcupadas[2] ? "true" : "false");
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
 void setup() {
 
     Serial.begin(115200);
+    cancela.setPeriodHertz(50);
+    cancela.attach(PINO_SERVO, 500, 2400);
+    cancela.write(ANGULO_FECHADO);
+    WiFi.begin(ssid, password);
+    server.on("/", handleRoot);
+    server.on("/status", handleStatus);
+    server.begin();
 
     // Botões
     pinMode(botaoPin, INPUT_PULLUP);   // Inicia o botão de entrada
@@ -62,16 +214,15 @@ void setup() {
       baseado na lista declarada anteriormente, conecta os
       Sensores / leds
     */
-    for (int i = 0; i < NUM_SENSORES; i++)
-    {
-
-        pinMode(trigPins[i], OUTPUT); // Conecta os triggers dos sensores
-        pinMode(echoPins[i], INPUT);  // Conecta os echo dos sensores
-        pinMode(ledPins[i],  OUTPUT); // Conecta os leds relacionados aos sensores
-
-        pinMode(trigPinsAdas[i], OUTPUT); // Conecta os triggers dos sensores
-        pinMode(echoPinsAdas[i], INPUT);  // Conecta os echo dos sensores
-        pinMode(ledPinsAdas[i],  OUTPUT); // Conecta os leds relacionados aos sensores
+    for (int i = 0; i < NUM_SENSORES; i++) {
+        pinMode(trigPins[i], OUTPUT);
+        pinMode(echoPins[i], INPUT);
+        pinMode(ledPins[i], OUTPUT);
+    }
+    for (int i = 0; i < NUM_SENSORES; i++) {
+        pinMode(trigPinsAdas[i], OUTPUT);
+        pinMode(echoPinsAdas[i], INPUT);
+        pinMode(ledPinsAdas[i], OUTPUT);
     }
 
 
@@ -86,12 +237,23 @@ void setup() {
 */
 // ================= LOOP =================
 void loop() {
+    static bool ipExibido = false;
+    if (!ipExibido && WiFi.status() == WL_CONNECTED) {
+        Serial.print("IP do ESP32: ");
+        Serial.println(WiFi.localIP());
+        ipExibido = true;
+    }
+    server.handleClient();
+    if (cancelaAberta && millis() - aberturaCancela >= TEMPO_ABERTO) {
+        cancela.write(ANGULO_FECHADO);
+        cancelaAberta = false;
+    }
 
     // Verificação dos botões
     verificarBotao();      // Verifica se o botão de entrada foi pressionado
     verificarBotaoSaida(); // Verifica se o botão de saída foi pressionado
     // VerificarTodosAdas(); - Sem uso na maquete
-    VerificarAdas(trigPinsAdas[0]);
+    VerificarTodosAdas();
 
     // Sistema desligado
     /*
@@ -102,7 +264,6 @@ void loop() {
         Serial.println("Sistema aguardando botão...");
         delay(100);
 
-        return;
     }
 
     // Leitura dos sensores
@@ -168,11 +329,14 @@ void VerificarTodosAdas() {
 }
 
 void AtualizarTela() {
-    
+
 }
 
 // ================= BOTÃO ENTRADA =================
 void verificarBotao() {
+    bool pressionada = digitalRead(botaoPin) == LOW;
+    bool novoClique = pressionada && !entradaPressionada;
+    entradaPressionada = pressionada;
 
     // Limite máximo do número de sensores
     if (cont_botao >= NUM_SENSORES + 1)
@@ -183,7 +347,7 @@ void verificarBotao() {
     }
 
     // Caso a quantia for menor que o máximo de sensores e o botão seja pressionado
-    if (digitalRead(botaoPin) == LOW)
+    if (novoClique)
     {
         // Primeiro clique OU cooldown (Debounce) concluído
         if (millis() - ultimoCliqueValido >= cooldownBotao || cont_botao == 0)
@@ -196,6 +360,7 @@ void verificarBotao() {
 
             // Incrementa entrada
             cont_botao++;
+            abrirCancela();
 
             Serial.print("Sistema iniciado. Total: ");
             Serial.println(cont_botao);
@@ -207,13 +372,16 @@ void verificarBotao() {
 
 // ================= BOTÃO SAÍDA =================
 void verificarBotaoSaida() {
+    bool pressionada = digitalRead(botaoSaida) == LOW;
+    bool novoClique = pressionada && !saidaPressionada;
+    saidaPressionada = pressionada;
 
     // Caso botão seja pressionado
-    if (digitalRead(botaoSaida) == LOW)
+    if (novoClique)
     {
 
         // Verifica cooldown (Debounce)
-        if (millis() - ultimoCliqueValidoSaida >= cooldownBotao)
+        if (ultimoCliqueValidoSaida == 0 || millis() - ultimoCliqueValidoSaida >= cooldownBotao)
         {
 
             // Garante que existe ao menos um veiculo estacionado
@@ -232,6 +400,7 @@ void verificarBotaoSaida() {
 
             // Salva ultimo clique em milissegundos para cooldown (Debounce)
             ultimoCliqueValidoSaida = millis();
+            abrirCancela();
 
             Serial.print("Veiculo saiu. Total: ");
             Serial.println(cont_botao);
@@ -293,6 +462,10 @@ void verificarDistancia(
 {
 
     int distance = DistanciaSensor(sensor);
+    vagasOcupadas[sensor] = distance > 0 && distance <= 20;
+    if (!sistemaLiberado) {
+        return;
+    }
 
     Serial.print("Sensor ");
     Serial.print(sensor + 1);
@@ -394,7 +567,7 @@ void EstacionandoFinal(
     AtualizarTela();
 }
 
-// Parte Adas 2 
+// Parte Adas 2
 
 void SensorAdas(
     int sensor
@@ -430,19 +603,7 @@ void ApagarTodosLed() {
 void SensorAdasMaquete(
     int sensor
 ) {
-    int echoPin = echoPinsAdas[sensor];
-    int ledPin  = ledPinsAdas[sensor];
-
     int distance = DistanciaSensorAdas(sensor);
-    ApagarTodosLed();
-    if (distance > NUM_SENSORES * 16) {
-        return;
-    }
-
-    int wantedsensor = floor(distance / 16);
-    if (wantedsensor != 0) {
-        wantedsensor -= 1;
-    }
-    AcenderLed(wantedsensor);
-
+    digitalWrite(ledPinsAdas[sensor], distance > 0 && distance <= DISTANCIAADAS ? HIGH : LOW);
 }
+
