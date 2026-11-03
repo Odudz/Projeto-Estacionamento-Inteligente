@@ -15,16 +15,14 @@ unsigned long ultimoCliqueValidoSaida = 0;
 
 // Estacionamento
 // Sensor Ultrassonico
-const int trigPins[] = {5,  35, 19};
-const int echoPins[] = {18, 34, 21};
-
-// Leds
-const int ledPins[]  = {15};
+const int trigPins[] = {5, 16, 21};
+const int echoPins[] = {18, 17, 19};
+const int ledPins[]  = {4, 14, 26};
 
 // Adas (Veiculos Passando na Frente)
-const int trigPinsAdas[] = {32};
-const int echoPinsAdas[] = {33};
-const int ledPinsAdas[]  = {16};
+const int trigPinsAdas[] = {12, 15, 2};
+const int echoPinsAdas[] = {13, 34, 35};
+const int ledPinsAdas[]  = {32, 33, 25};
 
 const int DISTANCIAADAS  = 100;
 
