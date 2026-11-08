@@ -1,2 +1,2 @@
 # Projeto-Estacionamento-Inteligente
-Projeto para faculdade da matéria: Conectividade de sistemas ciberficos
+Projeto de um estacionamento inteligente utilizando ESP32, sistema ADAS, tráfego cruzado, comunicação wi-fi e página WEB.
