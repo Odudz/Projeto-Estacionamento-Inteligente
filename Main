@@ -1,28 +1,93 @@
+/*
+   ESTACIONAMENTO INTELIGENTE - ESP32
+*/
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESP32Servo.h>
+#include <LittleFS.h>
+#include <time.h>
 
+
+/*
+   Configuracoes da rede e do historico
+*/
 
 const char* ssid = "TESTE_ESP";
 const char* password = "TESTE_ESP";
 
-WebServer server(80);
 
-/*
-  Entradas organizadas em listas, facilitando uso de multiplas entradas/sensores
-*/
+const bool FORMATAR_FLASH_SE_NECESSARIO = true;
+const int TAMANHO_MAX_LOG = 32000;  // Historico limitado a aproximadamente 32 KB.
+
+WebServer server(80);
+Servo cancela;
+bool flashDisponivel = false;
+
+
 
 const int botaoPin = 22;
 const int botaoSaida = 23;
-const unsigned long TEMPO_DEBOUNCE = 25;
 
+// Sensores de estacionamento: TRIG / ECHO / LED.
+const int trigPins[] = {5, 16, 21};
+const int echoPins[] = {18, 17, 19};
+const int ledPins[]  = {4, 14, 26};
+
+// Sensores ADAS: TRIG / ECHO / LED.
+const int trigPinsAdas[] = {12, 15, 2};
+const int echoPinsAdas[] = {13, 34, 35};
+const int ledPinsAdas[]  = {32, 33, 25};
+
+const int NUM_SENSORES = sizeof(trigPins) / sizeof(trigPins[0]);
+const int PINO_SERVO = 27;
+const int ANGULO_FECHADO = 105;
+const int ANGULO_ABERTO = 15;
+
+const int DISTANCIA_ADAS_CM = 6;
+const int DISTANCIA_OCUPADA_CM = 20;
+const int DISTANCIA_ORIENTACAO_CM = 12;
+
+const unsigned long TEMPO_ABERTO = 3000;
+const unsigned long TEMPO_DEBOUNCE = 25;
+const unsigned long INTERVALO_SENSORES = 60;
+
+const unsigned long TEMPO_MAX_ECO_US = 4000;
+const int LEITURAS_VERIFICACAO = 2 * NUM_SENSORES;
+
+
+/*
+   Variaveis do estacionamento
+*/
+
+bool cancelaAberta = false;
+bool vagasOcupadas[NUM_SENSORES] = {};
+bool vagasConhecidas[NUM_SENSORES] = {};
+bool mudancaPendente[NUM_SENSORES] = {};
+bool vagasEmOrientacao[NUM_SENSORES] = {};
+
+int distanciasVaga[NUM_SENSORES] = {};
+int distanciasAdas[NUM_SENSORES] = {};
+int falhasVaga[NUM_SENSORES] = {};
+int falhasAdas[NUM_SENSORES] = {};
+int leiturasEntrada[NUM_SENSORES] = {};
+
+bool entradaPendente = false;
+bool vagasVerificadas = false;
+int leiturasPrioritarias = LEITURAS_VERIFICACAO;
+unsigned long aberturaCancela = 0;
+unsigned long ultimaLeituraVaga[NUM_SENSORES] = {};
+
+
+// Detecta um clique (botao ligado ao GND, usando INPUT_PULLUP).
 struct Botao {
     explicit Botao(int pino) : pino(pino) {}
 
     bool novoClique() {
         const unsigned long agora = millis();
         const bool leitura = digitalRead(pino) == LOW;
+
         if (leitura != leituraAnterior) {
             leituraAnterior = leitura;
             ultimaMudanca = agora;
@@ -45,50 +110,71 @@ struct Botao {
 Botao entrada(botaoPin);
 Botao saida(botaoSaida);
 
-// Estacionamento
-// Sensor Ultrassonico
-const int trigPins[] = {5, 16, 21};
-const int echoPins[] = {18, 17, 19};
-const int ledPins[]  = {4, 14, 26};
-
-// Adas (Veiculos Passando na Frente)
-const int trigPinsAdas[] = {12, 15, 2};
-const int echoPinsAdas[] = {13, 34, 35};
-const int ledPinsAdas[]  = {32, 33, 25};
-
-const int DISTANCIA_ADAS_CM = 6;
-const int DISTANCIA_OCUPADA_CM = 20;
-const int DISTANCIA_ORIENTACAO_CM = 12;
 
 /*
-  Variaveis do sistema
+   Historico de eventos na memoria flash
 */
 
-// Número total de sensores
-const int NUM_SENSORES = sizeof(trigPins) / sizeof(trigPins[0]);
+String dataHora() {
+    time_t agora = time(nullptr);
 
-const int PINO_SERVO = 27;
-const int ANGULO_FECHADO = 105;
-const int ANGULO_ABERTO = 15;
-const unsigned long TEMPO_ABERTO = 3000;
-const unsigned long INTERVALO_SENSORES = 60;
-const unsigned long TEMPO_MAX_ECO_US = 4000;
-const int LEITURAS_VERIFICACAO = 2 * NUM_SENSORES;
-Servo cancela;
-bool cancelaAberta = false;
-unsigned long aberturaCancela = 0;
-bool vagasOcupadas[NUM_SENSORES] = {};
-bool mudancaPendente[NUM_SENSORES] = {};
-bool vagasEmOrientacao[NUM_SENSORES] = {};
-int leiturasPrioritarias = LEITURAS_VERIFICACAO;
-bool vagasVerificadas = false;
-bool entradaPendente = false;
+    if (agora < 1704067200) {
+        return "SEM_HORA (" + String(millis() / 1000) + "s desde inicializacao)";
+    }
 
-void abrirCancela() {
-    cancela.write(ANGULO_ABERTO);
-    aberturaCancela = millis();
-    cancelaAberta = true;
+    struct tm horario;
+    localtime_r(&agora, &horario);
+    char texto[24];
+    strftime(texto, sizeof(texto), "%d/%m/%Y %H:%M:%S", &horario);
+    return String(texto);
 }
+
+// Registra INFO, WARNING ou ERROR na Serial e em /eventos.txt (LittleFS).
+void registrar(const char* nivel, const String& mensagem) {
+    String linha = dataHora() + " [" + nivel + "] " + mensagem + "\n";
+    Serial.print(linha);
+
+    if (!flashDisponivel) return;
+
+    File arquivo = LittleFS.open("/eventos.txt", "a");
+    if (!arquivo) {
+        Serial.println("[ERROR] Nao foi possivel abrir o historico.");
+        return;
+    }
+
+    // Ao atingir o limite, inicia um novo historico para nao ocupar toda a flash.
+    if (arquivo.size() + linha.length() > TAMANHO_MAX_LOG) {
+        arquivo.close();
+        arquivo = LittleFS.open("/eventos.txt", "w");
+        if (!arquivo) return;
+        arquivo.print(dataHora() + " [WARNING] Historico antigo substituido por limite de espaco.\n");
+    }
+
+    arquivo.print(linha);
+    arquivo.close();
+}
+
+void handleLogs() {
+    if (!flashDisponivel) {
+        server.send(503, "text/plain; charset=utf-8", "LittleFS indisponivel. Verifique a Serial.");
+        return;
+    }
+
+    File arquivo = LittleFS.open("/eventos.txt", "r");
+    if (!arquivo) {
+        server.send(200, "text/plain; charset=utf-8", "Nenhum evento registrado.");
+        return;
+    }
+
+    server.sendHeader("Cache-Control", "no-store");
+    server.streamFile(arquivo, "text/plain; charset=utf-8");
+    arquivo.close();
+}
+
+
+/*
+   Controle da cancela e das vagas
+*/
 
 int contarVagasOcupadas() {
     int ocupadas = 0;
@@ -98,182 +184,100 @@ int contarVagasOcupadas() {
     return ocupadas;
 }
 
-void handleRoot() {
-  String html = R"rawliteral(
-<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Estacionamento Inteligente</title>
-  <style>
-    body { font-family: Arial, sans-serif; background: #f2f2f2; text-align: center; margin: 0; padding: 30px; }
-    h1 { color: #222; }
-    .container { max-width: 600px; margin: auto; }
-    .resumo { display: flex; justify-content: center; gap: 20px; margin: 30px 0; }
-    .card { background: white; padding: 25px; border-radius: 15px; box-shadow: 0 3px 10px rgba(0,0,0,0.15); flex: 1; }
-    .numero { font-size: 45px; font-weight: bold; }
-    .disponivel { color: #16a34a; }
-    .ocupado { color: #dc2626; }
-    .vagas { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; }
-    .vaga { background: white; padding: 20px; border-radius: 15px; box-shadow: 0 3px 10px rgba(0,0,0,0.15); }
-    .status { font-size: 18px; font-weight: bold; }
-  </style>
-</head>
-<body>
-
-<div class="container">
-  <h1>Estacionamento Inteligente</h1>
-
-  <div class="resumo">
-    <div class="card">
-      <div>Vagas disponíveis</div>
-      <div id="vagas-disponiveis" class="numero disponivel">--</div>
-    </div>
-    <div class="card">
-      <div>Vagas ocupadas</div>
-      <div id="vagas-ocupadas" class="numero ocupado">--</div>
-    </div>
-  </div>
-
-  <h2>Estado das vagas</h2>
-
-  <div class="vagas">
-    <div class="vaga">
-      <h3>Vaga 1</h3>
-      <div id="vaga1" class="status">Carregando...</div>
-    </div>
-    <div class="vaga">
-      <h3>Vaga 2</h3>
-      <div id="vaga2" class="status">Carregando...</div>
-    </div>
-    <div class="vaga">
-      <h3>Vaga 3</h3>
-      <div id="vaga3" class="status">Carregando...</div>
-    </div>
-  </div>
-
-  <p style="margin-top:30px;color:#777;">
-    Atualização em tempo real via AJAX
-  </p>
-</div>
-
-<script>
-  // Função que busca os dados atualizados do ESP32 via AJAX
-  function atualizarDados() {
-    fetch('/status')
-      .then(response => response.json())
-      .then(dados => {
-        if (!dados.pronto) return;
-
-        // Atualiza os contadores principais
-        document.getElementById('vagas-disponiveis').innerText = dados.disp;
-        document.getElementById('vagas-ocupadas').innerText = dados.ocup;
-
-        // Atualiza a Vaga 1
-        let v1 = document.getElementById('vaga1');
-        v1.innerHTML = dados.v1 ? "🔴 Ocupada" : "🟢 Disponível";
-        v1.className = dados.v1 ? "status ocupado" : "status disponivel";
-
-        // Atualiza a Vaga 2
-        let v2 = document.getElementById('vaga2');
-        v2.innerHTML = dados.v2 ? "🔴 Ocupada" : "🟢 Disponível";
-        v2.className = dados.v2 ? "status ocupado" : "status disponivel";
-
-        // Atualiza a Vaga 3
-        let v3 = document.getElementById('vaga3');
-        v3.innerHTML = dados.v3 ? "🔴 Ocupada" : "🟢 Disponível";
-        v3.className = dados.v3 ? "status ocupado" : "status disponivel";
-      })
-      .catch(err => console.error("Erro ao buscar dados do ESP32:", err));
-  }
-
-  // Executa a função imediatamente ao abrir o site
-  atualizarDados();
-  // Configura para rodar repetidamente a cada 1 segundo (1000ms)
-  setInterval(atualizarDados, 1000);
-</script>
-
-</body>
-</html>
-)rawliteral";
-
-  server.send(200, "text/html", html);
+void abrirCancela() {
+    cancela.write(ANGULO_ABERTO);
+    aberturaCancela = millis();
+    cancelaAberta = true;
+    registrar("INFO", "Cancela aberta.");
 }
 
-void handleStatus() {
-  const int vagasOcupadasCount = contarVagasOcupadas();
-  const int vagasDisponiveis = NUM_SENSORES - vagasOcupadasCount;
-
-  String json = "{";
-  json += "\"pronto\":" + String(vagasVerificadas ? "true" : "false") + ",";
-  json += "\"disp\":" + String(vagasDisponiveis) + ",";
-  json += "\"ocup\":" + String(vagasOcupadasCount) + ",";
-  json += "\"v1\":" + String(vagasOcupadas[0] ? "true" : "false") + ",";
-  json += "\"v2\":" + String(vagasOcupadas[1] ? "true" : "false") + ",";
-  json += "\"v3\":" + String(vagasOcupadas[2] ? "true" : "false");
-  json += "}";
-
-  server.send(200, "application/json", json);
-}
-
-void setup() {
-
-    Serial.begin(115200);
-    cancela.setPeriodHertz(50);
-    cancela.attach(PINO_SERVO, 500, 2400);
+void fecharCancela() {
+    if (!cancelaAberta) return;
     cancela.write(ANGULO_FECHADO);
-    WiFi.begin(ssid, password);
-    server.on("/", handleRoot);
-    server.on("/status", handleStatus);
-    server.begin();
+    cancelaAberta = false;
+    registrar("INFO", "Cancela fechada.");
+}
 
-    // Botões
-    // Cada botão conecta seu GPIO ao GND quando pressionado.
-    pinMode(botaoPin, INPUT_PULLUP);
-    pinMode(botaoSaida, INPUT_PULLUP);
-    Serial.println("Entrada pronta no GPIO 22. Saida pronta no GPIO 23.");
+// Inicia a verificacao das tres vagas antes de liberar a entrada.
+void solicitarEntrada() {
+    if (entradaPendente || cancelaAberta) return;
 
-    /*
-      Percorre um loop for baseado na quantia de sensores
-      baseado na lista declarada anteriormente, conecta os
-      Sensores / leds
-    */
+    entradaPendente = true;
+    leiturasPrioritarias = LEITURAS_VERIFICACAO;
+    for (int i = 0; i < NUM_SENSORES; i++) leiturasEntrada[i] = 0;
+    registrar("INFO", "Entrada solicitada.");
+}
+
+void concluirVerificacaoDeEntrada() {
+    if (!entradaPendente) return;
+    entradaPendente = false;
+
+    // Se algum sensor nao respondeu duas vezes, a entrada e bloqueada.
     for (int i = 0; i < NUM_SENSORES; i++) {
-        pinMode(trigPins[i], OUTPUT);
-        digitalWrite(trigPins[i], LOW);
-        pinMode(echoPins[i], INPUT);
-        pinMode(ledPins[i], OUTPUT);
-        digitalWrite(ledPins[i], LOW);
-
-        pinMode(trigPinsAdas[i], OUTPUT);
-        digitalWrite(trigPinsAdas[i], LOW);
-        pinMode(echoPinsAdas[i], INPUT);
-        pinMode(ledPinsAdas[i], OUTPUT);
-        digitalWrite(ledPinsAdas[i], LOW);
+        bool recente = millis() - ultimaLeituraVaga[i] <= 2000;
+        if (!vagasConhecidas[i] || leiturasEntrada[i] < 2 ||
+            distanciasVaga[i] == 0 || !recente || mudancaPendente[i]) {
+            registrar("WARNING", "Entrada bloqueada: sensor de vaga sem leitura confiavel.");
+            return;
+        }
     }
+
+    const int livres = NUM_SENSORES - contarVagasOcupadas();
+    if (livres == 0) {
+        registrar("WARNING", "Entrada bloqueada: estacionamento lotado.");
+        return;
+    }
+
+    for (int i = 0; i < NUM_SENSORES; i++) {
+        vagasEmOrientacao[i] = !vagasOcupadas[i];
+    }
+
+    abrirCancela();
+    registrar("INFO", "Entrada autorizada. Vagas livres: " + String(livres));
 }
 
 int medirDistancia(int trigPin, int echoPin) {
+    digitalWrite(trigPin, LOW);
+    delayMicroseconds(2);
     digitalWrite(trigPin, HIGH);
     delayMicroseconds(10);
     digitalWrite(trigPin, LOW);
-    return pulseIn(echoPin, HIGH, TEMPO_MAX_ECO_US) / 58;
+
+    const unsigned long duracao = pulseIn(echoPin, HIGH, TEMPO_MAX_ECO_US);
+    return duracao == 0 ? 0 : duracao / 58;
 }
 
 void verificarVaga(int sensor) {
     const int distancia = medirDistancia(trigPins[sensor], echoPins[sensor]);
-    const bool ocupada = distancia > 0 && distancia <= DISTANCIA_OCUPADA_CM;
+    distanciasVaga[sensor] = distancia;
+    ultimaLeituraVaga[sensor] = millis();
 
-    // Confirma a mudança em duas leituras para tolerar um eco perdido.
-    if (ocupada == vagasOcupadas[sensor]) {
+    if (distancia == 0) {
+        mudancaPendente[sensor] = false;
+        leiturasEntrada[sensor] = 0;
+        falhasVaga[sensor]++;
+        if (falhasVaga[sensor] == 5) {
+            registrar("WARNING", "Vaga " + String(sensor + 1) + ": sensor sem eco.");
+        }
+        return;  // Eco perdido nao significa vaga livre.
+    }
+
+    if (falhasVaga[sensor] >= 5) {
+        registrar("INFO", "Vaga " + String(sensor + 1) + ": sensor recuperado.");
+    }
+    falhasVaga[sensor] = 0;
+    if (entradaPendente) leiturasEntrada[sensor]++;
+
+    const bool ocupada = distancia <= DISTANCIA_OCUPADA_CM;
+
+    // Confirma a ocupacao com duas leituras seguidas.
+    if (vagasConhecidas[sensor] && ocupada == vagasOcupadas[sensor]) {
         mudancaPendente[sensor] = false;
     } else if (mudancaPendente[sensor]) {
         vagasOcupadas[sensor] = ocupada;
+        vagasConhecidas[sensor] = true;
         mudancaPendente[sensor] = false;
-        Serial.printf("VAGA %d: %s. Disponiveis: %d/%d.\n",
-                      sensor + 1, ocupada ? "ocupada" : "livre",
-                      NUM_SENSORES - contarVagasOcupadas(), NUM_SENSORES);
+        registrar("INFO", "Vaga " + String(sensor + 1) + (ocupada ? " ocupada." : " livre."));
     } else {
         mudancaPendente[sensor] = true;
     }
@@ -283,34 +287,14 @@ void verificarVaga(int sensor) {
         return;
     }
 
-    digitalWrite(ledPins[sensor],
-                 distancia > 0 && distancia <= DISTANCIA_ORIENTACAO_CM / 2 ? HIGH : LOW);
-
-    if (vagasOcupadas[sensor] && distancia > 0 &&
-        distancia <= DISTANCIA_ORIENTACAO_CM * 0.4) {
+    digitalWrite(ledPins[sensor], distancia <= DISTANCIA_ORIENTACAO_CM / 2 ? HIGH : LOW);
+    if (vagasOcupadas[sensor] && distancia <= DISTANCIA_ORIENTACAO_CM * 0.4) {
         for (int i = 0; i < NUM_SENSORES; i++) {
             vagasEmOrientacao[i] = false;
             digitalWrite(ledPins[i], vagasOcupadas[i] ? HIGH : LOW);
         }
+        registrar("INFO", "Orientacao das vagas encerrada.");
     }
-}
-
-void concluirVerificacaoDeEntrada() {
-    if (!entradaPendente) return;
-    entradaPendente = false;
-
-    const int livres = NUM_SENSORES - contarVagasOcupadas();
-    if (livres == 0) {
-        Serial.println("ENTRADA BLOQUEADA: todas as vagas estao ocupadas.");
-        return;
-    }
-
-    for (int i = 0; i < NUM_SENSORES; i++) {
-        vagasEmOrientacao[i] = !vagasOcupadas[i];
-        digitalWrite(ledPins[i], vagasOcupadas[i] ? HIGH : LOW);
-    }
-    abrirCancela();
-    Serial.printf("ENTRADA OK: %d/%d vagas livres. Cancela aberta.\n", livres, NUM_SENSORES);
 }
 
 void verificarProximoSensor() {
@@ -318,15 +302,25 @@ void verificarProximoSensor() {
     static int proximoAdas = 0;
     static bool vezDoAdas = false;
     static unsigned long ultimoDisparo = 0;
-    const unsigned long agora = millis();
-    if (agora - ultimoDisparo < INTERVALO_SENSORES) return;
-    ultimoDisparo = agora;
 
-    // Um disparo por intervalo para evitar interferência entre os sensores.
+    if (millis() - ultimoDisparo < INTERVALO_SENSORES) return;
+    ultimoDisparo = millis();
+
+    // Dispara apenas um sensor por vez, evitando interferencia.
     if (leiturasPrioritarias == 0 && vezDoAdas) {
         const int distancia = medirDistancia(trigPinsAdas[proximoAdas], echoPinsAdas[proximoAdas]);
+        distanciasAdas[proximoAdas] = distancia;
         digitalWrite(ledPinsAdas[proximoAdas],
                      distancia > 0 && distancia <= DISTANCIA_ADAS_CM ? HIGH : LOW);
+
+        if (distancia == 0) {
+            if (++falhasAdas[proximoAdas] == 5) {
+                registrar("WARNING", "ADAS " + String(proximoAdas + 1) + ": sensor sem eco.");
+            }
+        } else {
+            falhasAdas[proximoAdas] = 0;
+        }
+
         proximoAdas = (proximoAdas + 1) % NUM_SENSORES;
         vezDoAdas = false;
         return;
@@ -342,29 +336,289 @@ void verificarProximoSensor() {
     }
 }
 
-void loop() {
-    if (cancelaAberta && millis() - aberturaCancela >= TEMPO_ABERTO) {
-        cancela.write(ANGULO_FECHADO);
-        cancelaAberta = false;
+
+/*
+   Pagina web 
+*/
+
+const char html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Estacionamento Inteligente</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #f2f2f2; text-align: center; padding: 20px; }
+        .container { max-width: 700px; margin: auto; }
+        .resumo, .vagas { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+        .card { background: white; padding: 15px; border-radius: 12px; margin: 8px 0; }
+        .numero { font-size: 32px; font-weight: bold; }
+        .disponivel { color: #16a34a; }
+        .ocupado { color: #dc2626; }
+        button, input { padding: 10px; margin: 5px; }
+        pre { text-align: left; white-space: pre-wrap; max-height: 180px; overflow: auto; }
+        @media(max-width: 500px) { .resumo, .vagas { grid-template-columns: 1fr; } }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>Estacionamento Inteligente</h1>
+
+    <div class="resumo">
+        <div class="card">Disponíveis<div id="disp" class="numero disponivel">--</div></div>
+        <div class="card">Ocupadas<div id="ocup" class="numero ocupado">--</div></div>
+        <div class="card">Cancela<div id="cancela">--</div></div>
+    </div>
+
+    <h2>Estado das vagas</h2>
+    <div class="vagas">
+        <div class="card">Vaga 1<div id="vaga1">Carregando...</div></div>
+        <div class="card">Vaga 2<div id="vaga2">Carregando...</div></div>
+        <div class="card">Vaga 3<div id="vaga3">Carregando...</div></div>
+    </div>
+
+    <div class="card">
+        <h2>Rede e sensores</h2>
+        <p id="rede">Conectando...</p>
+        <p id="sensores">Aguardando leituras...</p>
+    </div>
+
+    <div class="card">
+        <h2>Controle remoto</h2>
+        <div>
+            <button onclick="comando('entrada')">Solicitar entrada</button>
+            <button onclick="comando('saida')">Abrir saída</button>
+            <button onclick="comando('fechar')">Fechar cancela</button>
+        </div>
+        <p id="resposta"></p>
+    </div>
+
+    <div class="card">
+        <h2>Histórico de eventos</h2>
+        <button onclick="atualizarLogs()">Atualizar histórico</button>
+        <pre id="logs">Carregando...</pre>
+    </div>
+</div>
+
+<script>
+    function mostrarDistancia(valor) {
+        return valor > 0 ? valor + ' cm' : 'Sem eco';
     }
 
-    if (entrada.novoClique() && !entradaPendente) {
-        entradaPendente = true;
-        leiturasPrioritarias = LEITURAS_VERIFICACAO;
+    async function atualizarDados() {
+        try {
+            const resposta = await fetch('/status');
+            const dados = await resposta.json();
+
+            document.getElementById('disp').innerText = dados.pronto ? dados.disp : '--';
+            document.getElementById('ocup').innerText = dados.pronto ? dados.ocup : '--';
+            document.getElementById('cancela').innerText = dados.cancela ? 'Aberta' : 'Fechada';
+
+            for (let i = 1; i <= 3; i++) {
+                const vaga = document.getElementById('vaga' + i);
+                const estado = dados['v' + i];
+                vaga.innerText = estado === null ? 'Sem leitura' : estado ? '🔴 Ocupada' : '🟢 Livre';
+                vaga.className = estado ? 'ocupado' : 'disponivel';
+            }
+
+            document.getElementById('rede').innerText =
+                'Wi-Fi: ' + dados.wifi + ' | IP: ' + dados.ip + ' | MAC: ' + dados.mac;
+            document.getElementById('sensores').innerText =
+                'Vagas: ' + dados.vagas.map(mostrarDistancia).join(' / ') + '\n' +
+                'ADAS: ' + dados.adas.map(mostrarDistancia).join(' / ');
+        } catch (erro) {
+            document.getElementById('rede').innerText = 'Sem comunicação com o ESP32.';
+        }
     }
-    if (saida.novoClique()) {
+
+    async function comando(acao) {
+        const saida = document.getElementById('resposta');
+
+        try {
+            const resposta = await fetch('/comando', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                },
+                body: 'acao=' + encodeURIComponent(acao)
+            });
+            saida.innerText = await resposta.text();
+            atualizarDados();
+        } catch (erro) {
+            saida.innerText = 'Erro ao enviar comando.';
+        }
+    }
+
+    async function atualizarLogs() {
+        try {
+            const resposta = await fetch('/logs');
+            const texto = await resposta.text();
+            document.getElementById('logs').innerText = texto.split('\n').slice(-26).join('\n');
+        } catch (erro) {
+            document.getElementById('logs').innerText = 'Não foi possível carregar o histórico.';
+        }
+    }
+
+    atualizarDados();
+    atualizarLogs();
+    setInterval(atualizarDados, 1000);
+    setInterval(atualizarLogs, 5000);
+</script>
+</body>
+</html>
+)rawliteral";
+
+void handleRoot() {
+    server.send_P(200, "text/html; charset=utf-8", html);
+}
+
+// Os dados podem ser consultados pela rede em /status.
+void handleStatus() {
+    bool pronto = vagasVerificadas;
+    for (int i = 0; i < NUM_SENSORES; i++) {
+        if (!vagasConhecidas[i] || distanciasVaga[i] == 0 ||
+            millis() - ultimaLeituraVaga[i] > 2000) pronto = false;
+    }
+
+    String json = "{";
+    json += "\"pronto\":" + String(pronto ? "true" : "false") + ",";
+    json += "\"disp\":" + String(NUM_SENSORES - contarVagasOcupadas()) + ",";
+    json += "\"ocup\":" + String(contarVagasOcupadas()) + ",";
+    json += "\"cancela\":" + String(cancelaAberta ? "true" : "false") + ",";
+    json += "\"entrada_pendente\":" + String(entradaPendente ? "true" : "false") + ",";
+
+    for (int i = 0; i < NUM_SENSORES; i++) {
+        json += "\"v" + String(i + 1) + "\":";
+        json += vagasConhecidas[i] ? (vagasOcupadas[i] ? "true" : "false") : "null";
+        json += ",";
+    }
+
+    json += "\"vagas\":[";
+    for (int i = 0; i < NUM_SENSORES; i++) {
+        if (i > 0) json += ",";
+        json += String(distanciasVaga[i]);
+    }
+    json += "],\"adas\":[";
+    for (int i = 0; i < NUM_SENSORES; i++) {
+        if (i > 0) json += ",";
+        json += String(distanciasAdas[i]);
+    }
+    json += "],";
+
+    json += "\"wifi\":\"" + String(WiFi.status() == WL_CONNECTED ? "Conectado" : "Desconectado") + "\",";
+    json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+    json += "\"mac\":\"" + WiFi.macAddress() + "\"";
+    json += "}";
+
+    server.send(200, "application/json", json);
+}
+
+// Recebe comandos do painel por POST, sem senha de controle.
+void handleComando() {
+    const String acao = server.arg("acao");
+    if (acao == "entrada") {
+        if (entradaPendente || cancelaAberta) {
+            server.send(409, "text/plain", "Cancela ocupada ou entrada em verificacao.");
+            return;
+        }
+        solicitarEntrada();
+        server.send(202, "text/plain", "Verificando vagas para liberar a entrada.");
+    } else if (acao == "saida") {
+        entradaPendente = false;
         abrirCancela();
         leiturasPrioritarias = LEITURAS_VERIFICACAO;
-        Serial.println("SAIDA OK: cancela aberta. Verificando quais vagas ficaram livres.");
+        server.send(200, "text/plain", "Saida liberada.");
+    } else if (acao == "fechar") {
+        entradaPendente = false;
+        fecharCancela();
+        registrar("INFO", "Fechamento remoto solicitado.");
+        server.send(200, "text/plain", "Comando de fechamento recebido.");
+    } else {
+        registrar("WARNING", "Comando remoto desconhecido.");
+        server.send(400, "text/plain", "Comando desconhecido.");
+    }
+}
+
+
+/*
+   Inicializacao e loop principal
+*/
+
+void setup() {
+    Serial.begin(115200);
+    cancela.setPeriodHertz(50);
+    cancela.attach(PINO_SERVO, 500, 2400);
+    cancela.write(ANGULO_FECHADO);
+
+    pinMode(botaoPin, INPUT_PULLUP);
+    pinMode(botaoSaida, INPUT_PULLUP);
+
+    for (int i = 0; i < NUM_SENSORES; i++) {
+        pinMode(trigPins[i], OUTPUT);
+        digitalWrite(trigPins[i], LOW);
+        pinMode(echoPins[i], INPUT);
+        pinMode(ledPins[i], OUTPUT);
+        digitalWrite(ledPins[i], LOW);
+
+        pinMode(trigPinsAdas[i], OUTPUT);
+        digitalWrite(trigPinsAdas[i], LOW);
+        pinMode(echoPinsAdas[i], INPUT);
+        pinMode(ledPinsAdas[i], OUTPUT);
+        digitalWrite(ledPinsAdas[i], LOW);
+    }
+
+    flashDisponivel = LittleFS.begin(FORMATAR_FLASH_SE_NECESSARIO);
+    if (!flashDisponivel) Serial.println("[ERROR] LittleFS nao montou. Logs apenas na Serial.");
+    registrar("INFO", "Estacionamento iniciado.");
+
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(ssid, password);
+
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/status", HTTP_GET, handleStatus);
+    server.on("/logs", HTTP_GET, handleLogs);
+    server.on("/comando", HTTP_POST, handleComando);
+    server.begin();
+    registrar("INFO", "Servidor web iniciado.");
+
+    Serial.println("Botao de entrada: GPIO 22 | Saida: GPIO 23 | Servo: GPIO 27");
+}
+
+void loop() {
+    if (cancelaAberta && millis() - aberturaCancela >= TEMPO_ABERTO) {
+        fecharCancela();
+    }
+
+    if (entrada.novoClique()) solicitarEntrada();
+    if (saida.novoClique()) {
+        entradaPendente = false;
+        abrirCancela();
+        leiturasPrioritarias = LEITURAS_VERIFICACAO;
     }
 
     verificarProximoSensor();
     server.handleClient();
 
-    static bool ipExibido = false;
-    if (!ipExibido && WiFi.status() == WL_CONNECTED) {
-        Serial.print("IP do ESP32: ");
-        Serial.println(WiFi.localIP());
-        ipExibido = true;
+    static bool wifiAnterior = false;
+    static bool relogioIniciado = false;
+    static unsigned long ultimaTentativa = 0;
+    bool conectado = WiFi.status() == WL_CONNECTED;
+
+    if (conectado && !wifiAnterior) {
+        registrar("INFO", "Wi-Fi conectado. IP: " + WiFi.localIP().toString() +
+                          " | MAC: " + WiFi.macAddress());
+        Serial.println("Pagina: http://" + WiFi.localIP().toString());
+        if (!relogioIniciado) {
+            configTzTime("<-03>3", "pool.ntp.org");  // Horario de Brasilia (UTC-3).
+            relogioIniciado = true;
+        }
     }
+    if (!conectado && wifiAnterior) registrar("WARNING", "Wi-Fi desconectado.");
+    if (!conectado && millis() - ultimaTentativa >= 30000) {
+        ultimaTentativa = millis();
+        WiFi.reconnect();
+    }
+    wifiAnterior = conectado;
 }
